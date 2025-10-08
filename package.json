@@ -1,6 +1,6 @@
 {
   "name": "vibe-ports",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Simple CLI to allocate, query and delete unique ports by (project, branch, purpose).",
   "bin": {
     "ports": "dist/index.js",
@@ -17,7 +17,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format cjs --target node18 --out-dir dist",
     "dev": "tsx src/index.ts --help",
-    "test": "vitest run",
+    "test": "npm run -s build && vitest run",
     "prepack": "npm run build"
   },
   "engines": {

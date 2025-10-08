@@ -202,19 +202,13 @@ var init_ranges = __esm({
   }
 });
 
-// src/index.ts
-var import_commander = require("commander");
-init_db();
-init_ranges();
-
-// src/core.ts
-init_db();
-init_ranges();
-
 // src/netutil.ts
-var import_net = __toESM(require("net"));
-var import_os2 = __toESM(require("os"));
-var import_child_process = require("child_process");
+var netutil_exports = {};
+__export(netutil_exports, {
+  findPidsByPort: () => findPidsByPort,
+  isPortFree: () => isPortFree,
+  killPortOccupants: () => killPortOccupants
+});
 function execCmd(cmd, timeoutMs = 1200) {
   return new Promise((resolve) => {
     const child = (0, import_child_process.exec)(cmd, { timeout: timeoutMs }, (error, stdout, stderr) => {
@@ -306,8 +300,25 @@ async function killPortOccupants(port, opts) {
   }
   return { killed };
 }
+var import_net, import_os2, import_child_process;
+var init_netutil = __esm({
+  "src/netutil.ts"() {
+    "use strict";
+    import_net = __toESM(require("net"));
+    import_os2 = __toESM(require("os"));
+    import_child_process = require("child_process");
+  }
+});
+
+// src/index.ts
+var import_commander = require("commander");
+init_db();
+init_ranges();
 
 // src/core.ts
+init_db();
+init_ranges();
+init_netutil();
 function getRangeForPurposeFromDB(db, purpose) {
   const row = db.prepare("SELECT start, end FROM purpose_ranges WHERE purpose = ?").get(purpose);
   if (row) return { start: row.start, end: row.end };
@@ -571,6 +582,12 @@ function listBindingsByPortRange(dbPath, start, end) {
   }
 }
 
+// src/index.ts
+init_netutil();
+var import_node_child_process2 = require("child_process");
+var import_node_path2 = __toESM(require("path"));
+var import_node_crypto2 = require("crypto");
+
 // src/mcp.ts
 init_db();
 init_ranges();
@@ -741,6 +758,219 @@ async function startMCP(dbPath) {
   await server.connect(transport);
 }
 
+// src/auto.ts
+var import_node_child_process = require("child_process");
+var import_node_path = __toESM(require("path"));
+var import_node_crypto = require("crypto");
+init_db();
+init_ranges();
+function tryExec(cmd) {
+  try {
+    const stdout = (0, import_node_child_process.execSync)(cmd, { stdio: ["ignore", "pipe", "ignore"], shell: "/bin/bash" }).toString();
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+function deriveFromGit() {
+  let project = "";
+  const remote = tryExec("git remote get-url origin 2>/dev/null");
+  if (remote && remote.length > 0) {
+    const m = remote.match(/([^\/]+?)(?:\.git)?$/);
+    if (m) project = m[1];
+  }
+  if (!project) {
+    const toplevel = tryExec("git rev-parse --show-toplevel 2>/dev/null");
+    if (toplevel && toplevel.length > 0) project = import_node_path.default.basename(toplevel);
+  }
+  if (!project) {
+    project = import_node_path.default.basename(process.cwd());
+  }
+  let branch = tryExec("git symbolic-ref --short -q HEAD") || "";
+  if (!branch) branch = tryExec("git rev-parse --short HEAD") || "";
+  if (!branch) branch = "nogit";
+  const slugRaw = `${project}-${branch}`;
+  const slug = slugRaw.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  const hash = (0, import_node_crypto.createHash)("sha1").update(slug).digest("hex").slice(0, 6);
+  const base = slug.length > 56 ? slug.slice(0, 56) : slug;
+  const slug_pg = `${base}_${hash}`;
+  return { project, branch, slug, slug_pg };
+}
+function ensurePurpose(input) {
+  const s = (input ?? "").toString().trim();
+  if (!s) throw new Error("purpose is required");
+  return normalizePurpose(s);
+}
+function registerAuto(program2) {
+  const auto = program2.command("auto").description("Use Git to derive project and branch, then run subcommands");
+  auto.command("keys").description("Print derived keys from Git (project, branch, slug, slug_pg)").action(() => {
+    const keys = deriveFromGit();
+    process.stdout.write(JSON.stringify(keys) + "\n");
+  });
+  auto.command("claim").description("Claim a port using project/branch derived from Git").requiredOption("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-S, --savage", "Reclaim the bound port by killing current listeners if occupied (only when record exists)", false).option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).action(async (cmdOpts) => {
+    const { project, branch } = deriveFromGit();
+    const purpose = ensurePurpose(cmdOpts.purpose);
+    const name = (cmdOpts.name ?? "default").trim() || "default";
+    const port = await claimPort(cmdOpts.db, project, branch, purpose, name, { savage: !!cmdOpts.savage });
+    const json = !!(cmdOpts.json || program2.opts()?.json);
+    if (json) {
+      process.stdout.write(JSON.stringify({ project, branch, purpose, name, port, db: cmdOpts.db ?? resolveDefaultDBPath(), savage: !!cmdOpts.savage }) + "\n");
+    } else {
+      process.stdout.write(String(port) + "\n");
+    }
+  });
+  auto.command("get").description("Get the port using project/branch derived from Git").requiredOption("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).action((cmdOpts) => {
+    const { project, branch } = deriveFromGit();
+    const purpose = ensurePurpose(cmdOpts.purpose);
+    const name = (cmdOpts.name ?? "default").trim() || "default";
+    const rows = listBindingsFiltered(cmdOpts.db, { project, branch, purpose, name });
+    if (rows.length === 0) throw new Error("Not found");
+    const port = rows[0].port;
+    const json = !!(cmdOpts.json || program2.opts()?.json);
+    if (json) {
+      process.stdout.write(JSON.stringify({ project, branch, purpose, name, port, db: cmdOpts.db ?? resolveDefaultDBPath() }) + "\n");
+    } else {
+      process.stdout.write(String(port) + "\n");
+    }
+  });
+  auto.command("delete").description("Delete bindings using project/branch derived from Git").option("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-A, --all", "Delete all matches for the derived project/branch (optionally filtered by purpose)", false).option("-K, --kill", "Kill listeners on the matched ports before deletion", false).option("-y, --yes", "Confirm deleting multiple entries (non-interactive)", false).option("-d, --dry-run", "Preview actions without killing or deleting", false).option("-f, --force", "Delete records even if port cannot be freed", false).option("-P, --port <port>", "Delete by port number (ignores git-derived keys)").option("-R, --range <start-end>", "Delete all bindings whose port in range START-END (ignores git-derived keys)").option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).action(async (cmdOpts) => {
+    const { project, branch } = deriveFromGit();
+    const json = !!(cmdOpts.json || program2.opts()?.json);
+    let matches = [];
+    if (cmdOpts.port && cmdOpts.range) throw new Error("Provide either --port or --range, not both.");
+    if (cmdOpts.range) {
+      const m = cmdOpts.range.match(/^(\d+)-(\d+)$/);
+      if (!m) throw new Error("Invalid --range. Use START-END");
+      let start = parseInt(m[1], 10);
+      let end = parseInt(m[2], 10);
+      if (Number.isNaN(start) || Number.isNaN(end) || start < 1 || end < 1 || start > 65535 || end > 65535) throw new Error("Ports in --range must be 1-65535");
+      const rows = listBindingsByPortRange(cmdOpts.db, start, end);
+      matches = rows.map((r) => ({ project: r.project, branch: r.branch, purpose: r.purpose, name: r.name, port: r.port }));
+    } else if (cmdOpts.port) {
+      const port = parseInt(cmdOpts.port, 10);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid --port");
+      const row = getBindingByPort(cmdOpts.db, port);
+      if (!row) throw new Error("Not found");
+      matches = [{ project: row.project, branch: row.branch, purpose: row.purpose, name: row.name, port: row.port }];
+    } else {
+      if (cmdOpts.all) {
+        const rows = listBindingsFiltered(cmdOpts.db, { project, branch, purpose: cmdOpts.purpose ? ensurePurpose(cmdOpts.purpose) : void 0, name: void 0 });
+        matches = rows.map((r) => ({ project: r.project, branch: r.branch, purpose: r.purpose, name: r.name, port: r.port }));
+      } else {
+        if (!cmdOpts.purpose) throw new Error("Provide --purpose or use --all for batch delete");
+        const purpose = ensurePurpose(cmdOpts.purpose);
+        const name = (cmdOpts.name ?? "default").trim() || "default";
+        const rows = listBindingsFiltered(cmdOpts.db, { project, branch, purpose, name });
+        if (rows.length === 0) throw new Error("Not found");
+        matches = rows.map((r) => ({ project: r.project, branch: r.branch, purpose: r.purpose, name: r.name, port: r.port }));
+      }
+    }
+    if (matches.length === 0) {
+      if (json) process.stdout.write(JSON.stringify({ matched: 0, deleted: 0, items: [], db: cmdOpts.db ?? resolveDefaultDBPath() }) + "\n");
+      else process.stderr.write("No matching bindings\n");
+      process.exit(matches.length === 0 ? 1 : 0);
+    }
+    if (matches.length > 1 && !cmdOpts.yes && !cmdOpts.dryRun) {
+      process.stderr.write(`Matched ${matches.length} items. Re-run with --yes to proceed, or use --dry-run to preview.
+`);
+      process.exit(1);
+    }
+    const results = [];
+    for (const m of matches) {
+      if (cmdOpts.dryRun) {
+        const { findPidsByPort: findPidsByPort2 } = await Promise.resolve().then(() => (init_netutil(), netutil_exports));
+        const pids = await findPidsByPort2(m.port);
+        results.push({ ...m, killed_pids: cmdOpts.kill ? pids : [], deleted: false, reason: "dry-run" });
+        continue;
+      }
+      try {
+        if (cmdOpts.kill) {
+          try {
+            const { killPortOccupants: killPortOccupants2 } = await Promise.resolve().then(() => (init_netutil(), netutil_exports));
+            const { killed } = await killPortOccupants2(m.port);
+            results.push({ ...m, killed_pids: killed, deleted: false });
+          } catch (e) {
+            if (!cmdOpts.force) {
+              results.push({ ...m, deleted: false, reason: `kill failed: ${e?.message || String(e)}` });
+              continue;
+            } else {
+              results.push({ ...m, killed_pids: [], deleted: false, reason: `kill failed but forcing delete: ${e?.message || String(e)}` });
+            }
+          }
+        } else {
+          if (!cmdOpts.force) {
+            const { isPortFree: isPortFree2 } = await Promise.resolve().then(() => (init_netutil(), netutil_exports));
+            const free = await isPortFree2(m.port);
+            if (!free) {
+              results.push({ ...m, deleted: false, reason: "port occupied; use --kill or --force to delete record anyway" });
+              continue;
+            }
+          }
+        }
+        const ok = deleteByPort(cmdOpts.db, m.port);
+        if (!ok) results.push({ ...m, deleted: false, reason: "not found (already deleted?)" });
+        else {
+          const last = results[results.length - 1];
+          if (last && last.port === m.port) last.deleted = true;
+          else results.push({ ...m, deleted: true });
+        }
+      } catch (e) {
+        results.push({ ...m, deleted: false, reason: e?.message || String(e) });
+      }
+    }
+    const deletedCount = results.filter((r) => r.deleted).length;
+    if (json) process.stdout.write(JSON.stringify({ matched: matches.length, deleted: deletedCount, items: results, db: cmdOpts.db ?? resolveDefaultDBPath() }) + "\n");
+    else {
+      for (const r of results) {
+        const head = `${r.project}/${r.branch}/${r.purpose}/${r.name} port=${r.port}`;
+        if (r.deleted) process.stdout.write(`${head} -> deleted${r.killed_pids && r.killed_pids.length ? ` (killed: ${r.killed_pids.join(",")})` : ""}
+`);
+        else process.stdout.write(`${head} -> skipped${r.reason ? ` (${r.reason})` : ""}
+`);
+      }
+      process.stdout.write(`
+Deleted ${deletedCount} of ${matches.length} matching bindings.
+`);
+    }
+  });
+  auto.command("list").description("List bindings for derived project/branch (optional filters)").option("-u, --purpose <purpose>", "Filter by purpose").option("-n, --name <name>", "Filter by name").option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).action((cmdOpts) => {
+    const { project, branch } = deriveFromGit();
+    const purpose = cmdOpts.purpose ? normalizePurpose(cmdOpts.purpose) : void 0;
+    const name = cmdOpts.name;
+    const rows = listBindingsFiltered(cmdOpts.db, { project, branch, purpose, name });
+    const json = !!(cmdOpts.json || program2.opts()?.json);
+    if (json) {
+      process.stdout.write(JSON.stringify({ db: cmdOpts.db ?? resolveDefaultDBPath(), count: rows.length, items: rows, project, branch }) + "\n");
+      return;
+    }
+    if (rows.length === 0) {
+      process.stdout.write("No bindings found.\n");
+      return;
+    }
+    const headers = ["PROJECT", "BRANCH", "PURPOSE", "NAME", "CLAIMED", "PORT", "CREATED_AT", "UPDATED_AT"];
+    const widths = [
+      Math.max(headers[0].length, ...rows.map((r) => r.project.length)),
+      Math.max(headers[1].length, ...rows.map((r) => r.branch.length)),
+      Math.max(headers[2].length, ...rows.map((r) => r.purpose.length)),
+      Math.max(headers[3].length, ...rows.map((r) => r.name.length)),
+      Math.max(headers[4].length, ...rows.map((r) => String(r.claimed ?? 0).length)),
+      Math.max(headers[5].length, ...rows.map((r) => String(r.port).length)),
+      Math.max(headers[6].length, ...rows.map((r) => r.created_at.length)),
+      Math.max(headers[7].length, ...rows.map((r) => r.updated_at.length))
+    ];
+    const pad = (s, w) => s + " ".repeat(Math.max(0, w - s.length));
+    const line = (cols) => cols.map((c, i) => pad(c, widths[i])).join("  ") + "\n";
+    process.stdout.write(line(headers));
+    process.stdout.write(line(widths.map((w) => "-".repeat(w))));
+    for (const r of rows) {
+      process.stdout.write(line([r.project, r.branch, r.purpose, r.name, String(r.claimed ?? 0), String(r.port), r.created_at, r.updated_at]));
+    }
+    process.stdout.write(`
+Total: ${rows.length}  DB: ${cmdOpts.db ?? resolveDefaultDBPath()} (project=${project}, branch=${branch})
+`);
+  });
+}
+
 // src/index.ts
 function toOutputMode(opts) {
   return opts.json ? "json" : "text";
@@ -767,7 +997,7 @@ function sanitizeText(input, name) {
   if (!v) fail(`${name} is required`);
   return v;
 }
-function ensurePurpose(input) {
+function ensurePurpose2(input) {
   try {
     return normalizePurpose(input);
   } catch (e) {
@@ -775,14 +1005,14 @@ function ensurePurpose(input) {
   }
 }
 var program = new import_commander.Command();
-program.name("ports").description("Allocate, query and delete unique ports by (project, branch, purpose).").version("0.2.1", "-v, --version", "Show version").helpOption("-h, --help", "Show help").addHelpCommand("help [command]", "Show help for command").showHelpAfterError().option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).hook("preAction", () => {
+program.name("ports").description("Allocate, query and delete unique ports by (project, branch, purpose).").version("0.3.0", "-v, --version", "Show version").helpOption("-h, --help", "Show help").addHelpCommand("help [command]", "Show help for command").showHelpAfterError().option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).hook("preAction", () => {
 });
 program.command("allocate").description("Allocate a port for given project, branch and purpose (idempotent).").requiredOption("-p, --project <project>", "Project name").requiredOption("-b, --branch <branch>", "Branch name").requiredOption("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-F, --fail-if-exists", "Fail if the tuple already exists instead of returning existing port", false).action((cmdOpts) => {
   const opts = program.opts();
   const mode = toOutputMode(opts);
   const project = sanitizeText(cmdOpts.project, "project");
   const branch = sanitizeText(cmdOpts.branch, "branch");
-  const purpose = ensurePurpose(cmdOpts.purpose);
+  const purpose = ensurePurpose2(cmdOpts.purpose);
   const name = (cmdOpts.name ?? "default").trim() || "default";
   const port = allocatePort(opts.db, project, branch, purpose, { failIfExists: !!cmdOpts.failIfExists, name });
   printResult(mode, { project, branch, purpose, name, port, db: opts.db ?? resolveDefaultDBPath() });
@@ -792,7 +1022,7 @@ program.command("get").description("Get the port for given project, branch and p
   const mode = toOutputMode(opts);
   const project = sanitizeText(cmdOpts.project, "project");
   const branch = sanitizeText(cmdOpts.branch, "branch");
-  const purpose = ensurePurpose(cmdOpts.purpose);
+  const purpose = ensurePurpose2(cmdOpts.purpose);
   const name = (cmdOpts.name ?? "default").trim() || "default";
   const rows = listBindings(opts.db).filter((r) => r.project === project && r.branch === branch && r.purpose === purpose && r.name === name);
   if (rows.length === 0) fail("Not found");
@@ -852,7 +1082,7 @@ program.command("delete").description("Delete a binding by key (project/branch/p
     if (!cmdOpts.project) fail("When using --all, at least --project is required");
     const project = sanitizeText(cmdOpts.project, "project");
     const branch = cmdOpts.branch ? sanitizeText(cmdOpts.branch, "branch") : void 0;
-    const purpose = cmdOpts.purpose ? ensurePurpose(cmdOpts.purpose) : void 0;
+    const purpose = cmdOpts.purpose ? ensurePurpose2(cmdOpts.purpose) : void 0;
     const rows = listBindingsFiltered(opts.db, { project, branch, purpose, name: void 0 });
     matches = rows.map((r) => ({ project: r.project, branch: r.branch, purpose: r.purpose, name: r.name, port: r.port }));
   } else {
@@ -861,7 +1091,7 @@ program.command("delete").description("Delete a binding by key (project/branch/p
     }
     const project = sanitizeText(cmdOpts.project, "project");
     const branch = sanitizeText(cmdOpts.branch, "branch");
-    const purpose = ensurePurpose(cmdOpts.purpose);
+    const purpose = ensurePurpose2(cmdOpts.purpose);
     const name = (cmdOpts.name ?? "default").trim() || "default";
     const rows = listBindingsFiltered(opts.db, { project, branch, purpose, name });
     if (rows.length === 0) fail("Not found");
@@ -986,7 +1216,7 @@ program.command("claim").description("Safely claim a port for a given key, or, w
   const mode = toOutputMode(opts);
   const project = sanitizeText(cmdOpts.project, "project");
   const branch = sanitizeText(cmdOpts.branch, "branch");
-  const purpose = ensurePurpose(cmdOpts.purpose);
+  const purpose = ensurePurpose2(cmdOpts.purpose);
   const name = (cmdOpts.name ?? "default").trim() || "default";
   const port = await claimPort(opts.db, project, branch, purpose, name, { savage: !!cmdOpts.savage });
   printResult(mode, { project, branch, purpose, name, port, db: opts.db ?? resolveDefaultDBPath(), savage: !!cmdOpts.savage });
@@ -1179,6 +1409,7 @@ program.command("find").alias("free").description("Find a free OS port (and by d
   const port = await findFreePort(opts.db, start, end, { includeRegistered: !!cmdOpts.includeRegistered, includeReserved: !!cmdOpts.includeReserved });
   printResult(mode, { port, start: Math.min(start, end), end: Math.max(start, end), db: opts.db ?? resolveDefaultDBPath(), includeRegistered: !!cmdOpts.includeRegistered, includeReserved: !!cmdOpts.includeReserved });
 });
+registerAuto(program);
 program.parseAsync().catch((err) => {
   process.stderr.write((err?.message || String(err)) + "\n");
   process.exit(1);

@@ -37,6 +37,15 @@ CLI
 - Get
   - `ports get --project myproj --branch feat-x --purpose frontend [--name default]`
 
+- Auto (derive project/branch from Git)
+  - Print derived keys: `ports auto keys` → `{ project, branch, slug, slug_pg }`
+  - Claim using Git-derived project/branch: `ports auto claim -u backend [-n name] [--savage]`
+  - Get using Git-derived project/branch: `ports auto get -u backend [-n name]`
+  - Delete using Git-derived project/branch:
+    - Single key: `ports auto delete -u backend [-n name] [--kill]`
+    - Batch: `ports auto delete --all [-u backend] [--kill] [--yes] [--dry-run] [--force]`
+  - List for current repo/branch: `ports auto list [-u backend] [-n name] [--json]`
+
 - Delete
   - By key: `ports delete --project myproj --branch feat-x --purpose frontend [--name default]`
   - By port: `ports delete --port 8000`
@@ -98,6 +107,13 @@ Permissions and OS dependencies
 
 - 守护进程注意
   - 被守护的服务可能在 KILL 后立刻被拉起，导致端口再次被占用；此时会报错，或需使用 `--force` 仅删登记。
+
+Git 绑定（Auto）细则
+
+- project 取值优先级：`git remote get-url origin` 仓库名 → `git rev-parse --show-toplevel` 的目录名 → 当前工作目录名。
+- branch 取值优先级：`git symbolic-ref --short -q HEAD` → `git rev-parse --short HEAD`（Detached HEAD 用短 SHA）→ `nogit`。
+- slug：`project-branch` 小写清洗（非字母数字转 `_`，折叠 `_`，去首尾 `_`）。
+- slug_pg：`slug` 截断至 56 + `_` + sha1 前 6（方便符合 63 长度限制）。
 
 Recommended usage (claim vs claim --savage)
 

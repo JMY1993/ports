@@ -4,7 +4,11 @@ import { resolveDefaultDBPath, CODE_SCHEMA_VERSION, openDB, closeDB, getDbVersio
 import { normalizePurpose, Purpose } from './ranges';
 import { allocatePort, getPort, deleteBinding, listBindings, claimPort, findFreePort, deleteByPort, deleteByRange, listBindingsFiltered, getBindingByPort, listBindingsByPortRange } from './core';
 import { findPidsByPort, killPortOccupants, isPortFree } from './netutil';
+import { execSync } from 'node:child_process';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { startMCP } from './mcp';
+import { registerAuto } from './auto';
 
 type OutputMode = 'text' | 'json';
 
@@ -50,11 +54,46 @@ function ensurePurpose(input: string): Purpose {
   }
 }
 
+
+function tryExec(cmd: string): string | null {
+  try {
+    const stdout = execSync(cmd, { stdio: ["ignore", "pipe", "ignore"], shell: "/bin/bash" }).toString();
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+function deriveFromGit(): { project: string; branch: string; slug: string; slug_pg: string; source: { project: string; branch: string } } {
+  let project = "";
+  const remote = tryExec("git remote get-url origin 2>/dev/null");
+  if (remote && remote.length > 0) {
+    const m = remote.match(/([^\/]+?)(?:\.git)?$/);
+    if (m) project = m[1];
+  }
+  if (!project) {
+    const toplevel = tryExec("git rev-parse --show-toplevel 2>/dev/null");
+    if (toplevel && toplevel.length > 0) project = path.basename(toplevel);
+  }
+  if (!project) {
+    project = path.basename(process.cwd());
+  }
+  let branch = tryExec("git symbolic-ref --short -q HEAD") || "";
+  if (!branch) branch = tryExec("git rev-parse --short HEAD") || "";
+  if (!branch) branch = "nogit";
+  const slugRaw = `${project}-${branch}`;
+  const slug = slugRaw.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  const hash = createHash("sha1").update(slug).digest("hex").slice(0, 6);
+  const base = slug.length > 56 ? slug.slice(0, 56) : slug;
+  const slug_pg = `${base}_${hash}`;
+  return { project, branch, slug, slug_pg, source: { project: remote ? "origin" : "cwd", branch: branch === "nogit" ? "fallback" : "git" } };
+}
+
 const program = new Command();
 program
   .name('ports')
   .description('Allocate, query and delete unique ports by (project, branch, purpose).')
-  .version('0.2.1', '-v, --version', 'Show version')
+  .version('0.3.0', '-v, --version', 'Show version')
   .helpOption('-h, --help', 'Show help')
   .addHelpCommand('help [command]', 'Show help for command')
   .showHelpAfterError()
@@ -553,6 +592,8 @@ program
     printResult(mode, { port, start: Math.min(start, end), end: Math.max(start, end), db: opts.db ?? resolveDefaultDBPath(), includeRegistered: !!cmdOpts.includeRegistered, includeReserved: !!cmdOpts.includeReserved });
   });
 
+// Register auto commands (Git-derived project/branch helpers)
+registerAuto(program);
 program.parseAsync().catch((err) => {
   process.stderr.write((err?.message || String(err)) + '\n');
   process.exit(1);
