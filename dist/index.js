@@ -146,6 +146,67 @@ function maybeMigrate(db) {
       setDbVersion(db, dbVersion);
       continue;
     }
+    if (dbVersion === 5) {
+      const cols = db.prepare("PRAGMA table_info('bindings')").all();
+      const hasClaimed = cols.some((c) => c.name === "claimed");
+      if (hasClaimed) {
+        db.exec(`
+          CREATE TABLE bindings_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT 'default',
+            port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (length(trim(project)) > 0),
+            CHECK (length(trim(branch)) > 0),
+            CHECK (length(trim(purpose)) > 0),
+            CHECK (length(trim(name)) > 0)
+          );
+          INSERT INTO bindings_new SELECT id, project, branch, purpose, name, port, created_at, updated_at FROM bindings;
+          DROP TABLE bindings;
+          ALTER TABLE bindings_new RENAME TO bindings;
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_unique_combo ON bindings(project, branch, purpose, name);
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_port_unique ON bindings(port);
+        `);
+      }
+      dbVersion = 6;
+      setDbVersion(db, dbVersion);
+      continue;
+    }
+    if (dbVersion === 6) {
+      const hasTemplateStrings = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='template_strings'").get();
+      if (!hasTemplateStrings) {
+        db.exec(`
+          CREATE TABLE template_strings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template TEXT NOT NULL,
+            vars TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (length(trim(template)) > 0),
+            CHECK (length(trim(vars)) > 0),
+            CHECK (length(trim(value)) > 0),
+            CHECK (json_valid(vars) = 1)
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_template_strings_unique_combo
+            ON template_strings(template, vars);
+          CREATE TRIGGER IF NOT EXISTS template_strings_updated
+          AFTER UPDATE ON template_strings
+          FOR EACH ROW
+          BEGIN
+            UPDATE template_strings SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = OLD.id;
+          END;
+        `);
+      }
+      dbVersion = 7;
+      setDbVersion(db, dbVersion);
+      continue;
+    }
     break;
   }
   const sql = import_fs.default.readFileSync(baselinePath, "utf8");
@@ -178,7 +239,7 @@ var init_db = __esm({
     import_path = __toESM(require("path"));
     import_os = __toESM(require("os"));
     import_better_sqlite3 = __toESM(require("better-sqlite3"));
-    CODE_SCHEMA_VERSION = 5;
+    CODE_SCHEMA_VERSION = 7;
   }
 });
 
@@ -343,7 +404,7 @@ function allocatePort(dbPath, project, branch, purpose, opts) {
       return existing.port;
     }
     const insertStmt = db.prepare(
-      "INSERT INTO bindings (project, branch, purpose, name, claimed, port) VALUES (?, ?, ?, ?, ?, ?)"
+      "INSERT INTO bindings (project, branch, purpose, name, port) VALUES (?, ?, ?, ?, ?)"
     );
     const range = getRangeForPurposeFromDB(db, purpose);
     if (!range) {
@@ -363,7 +424,7 @@ function allocatePort(dbPath, project, branch, purpose, opts) {
       for (let p = range.start; p <= range.end; p++) {
         if (isReserved.get(p)) continue;
         try {
-          insertStmt.run(project, branch, purpose, name, 0, p);
+          insertStmt.run(project, branch, purpose, name, p);
           return p;
         } catch (err) {
           const msg = err?.message ?? "";
@@ -408,7 +469,7 @@ function listBindings(dbPath) {
   const ctx = openDB(dbPath);
   const { db } = ctx;
   try {
-    const rows = db.prepare("SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings ORDER BY project, branch, purpose, name").all();
+    const rows = db.prepare("SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings ORDER BY project, branch, purpose, name").all();
     return rows;
   } finally {
     closeDB(ctx);
@@ -437,7 +498,7 @@ function listBindingsFiltered(dbPath, filters) {
       params.push(filters.name);
     }
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-    const sql = `SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings ${where} ORDER BY project, branch, purpose, name`;
+    const sql = `SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings ${where} ORDER BY project, branch, purpose, name`;
     const rows = db.prepare(sql).all(...params);
     return rows;
   } finally {
@@ -460,7 +521,7 @@ async function claimPort(dbPath, project, branch, purpose, name, opts) {
         );
       }
       const insert = db.prepare(
-        "INSERT INTO bindings (project, branch, purpose, name, claimed, port) VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT INTO bindings (project, branch, purpose, name, port) VALUES (?, ?, ?, ?, ?)"
       );
       const checkAgain = () => select.get(project, branch, purpose, name);
       if (checkAgain()) return checkAgain().port;
@@ -469,7 +530,7 @@ async function claimPort(dbPath, project, branch, purpose, name, opts) {
         const tx = db.transaction((p) => {
           const a = checkAgain();
           if (a) return a.port;
-          insert.run(project, branch, purpose, name, opts?.savage ? 1 : 0, p);
+          insert.run(project, branch, purpose, name, p);
           return p;
         });
         return tx(port);
@@ -481,9 +542,6 @@ async function claimPort(dbPath, project, branch, purpose, name, opts) {
         if (!free) continue;
         try {
           const got = insertOnce(p);
-          if (opts?.savage) {
-            db.prepare("UPDATE bindings SET claimed = 1 WHERE port = ?").run(got);
-          }
           return got;
         } catch (e) {
           continue;
@@ -497,7 +555,6 @@ async function claimPort(dbPath, project, branch, purpose, name, opts) {
       if (!free) {
         await killPortOccupants(currentPort);
       }
-      db.prepare("UPDATE bindings SET claimed = 1 WHERE port = ?").run(currentPort);
       return currentPort;
     }
     return currentPort;
@@ -561,7 +618,7 @@ function getBindingByPort(dbPath, port) {
   const { db } = ctx;
   try {
     const row = db.prepare(
-      "SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings WHERE port = ? LIMIT 1"
+      "SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings WHERE port = ? LIMIT 1"
     ).get(port);
     return row;
   } finally {
@@ -574,7 +631,7 @@ function listBindingsByPortRange(dbPath, start, end) {
   const { db } = ctx;
   try {
     const rows = db.prepare(
-      "SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings WHERE port BETWEEN ? AND ? ORDER BY port"
+      "SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings WHERE port BETWEEN ? AND ? ORDER BY port"
     ).all(start, end);
     return rows;
   } finally {
@@ -584,6 +641,88 @@ function listBindingsByPortRange(dbPath, start, end) {
 
 // src/index.ts
 init_netutil();
+
+// src/templates.ts
+init_db();
+function normalizeVars(vars) {
+  const sorted = Object.keys(vars).sort().reduce((acc, key) => {
+    acc[key] = vars[key];
+    return acc;
+  }, {});
+  return JSON.stringify(sorted);
+}
+function extractPlaceholders(template) {
+  const matches = template.match(/{([^}]+)}/g) || [];
+  return matches.map((m) => m.slice(1, -1));
+}
+function renderTemplate(template, vars) {
+  let result = template;
+  const placeholders = extractPlaceholders(template);
+  for (const placeholder of placeholders) {
+    if (!(placeholder in vars)) {
+      throw new Error(`Missing variable: ${placeholder}`);
+    }
+    result = result.replace(`{${placeholder}}`, vars[placeholder]);
+  }
+  return result;
+}
+async function claimTemplate(dbPath, template, vars) {
+  const normalizedVars = normalizeVars(vars);
+  const renderedValue = renderTemplate(template, vars);
+  const ctx = openDB(dbPath);
+  try {
+    const existing = ctx.db.prepare(
+      "SELECT value FROM template_strings WHERE template = ? AND vars = ?"
+    ).get(template, normalizedVars);
+    if (existing) {
+      return existing.value;
+    }
+    ctx.db.prepare(
+      "INSERT INTO template_strings (template, vars, value) VALUES (?, ?, ?)"
+    ).run(template, normalizedVars, renderedValue);
+    return renderedValue;
+  } finally {
+    closeDB(ctx);
+  }
+}
+function listTemplateStrings(dbPath, filterTemplate) {
+  const ctx = openDB(dbPath);
+  try {
+    let rows;
+    if (filterTemplate) {
+      rows = ctx.db.prepare(
+        "SELECT * FROM template_strings WHERE template = ? ORDER BY created_at"
+      ).all(filterTemplate);
+    } else {
+      rows = ctx.db.prepare(
+        "SELECT * FROM template_strings ORDER BY created_at"
+      ).all();
+    }
+    return rows.map((row) => ({
+      template: row.template,
+      vars: JSON.parse(row.vars),
+      value: row.value,
+      created_at: row.created_at,
+      updated_at: row.updated_at
+    }));
+  } finally {
+    closeDB(ctx);
+  }
+}
+function deleteTemplateString(dbPath, template, vars) {
+  const normalizedVars = normalizeVars(vars);
+  const ctx = openDB(dbPath);
+  try {
+    const result = ctx.db.prepare(
+      "DELETE FROM template_strings WHERE template = ? AND vars = ?"
+    ).run(template, normalizedVars);
+    return (result.changes ?? 0) > 0;
+  } finally {
+    closeDB(ctx);
+  }
+}
+
+// src/index.ts
 var import_node_child_process2 = require("child_process");
 var import_node_path2 = __toESM(require("path"));
 var import_node_crypto2 = require("crypto");
@@ -814,7 +953,7 @@ function registerAuto(program2) {
     const port = await claimPort(cmdOpts.db, project, branch, purpose, name, { savage: !!cmdOpts.savage });
     const json = !!(cmdOpts.json || program2.opts()?.json);
     if (json) {
-      process.stdout.write(JSON.stringify({ project, branch, purpose, name, port, db: cmdOpts.db ?? resolveDefaultDBPath(), savage: !!cmdOpts.savage }) + "\n");
+      process.stdout.write(JSON.stringify({ project, branch, purpose, name, port, db: cmdOpts.db ?? resolveDefaultDBPath() }) + "\n");
     } else {
       process.stdout.write(String(port) + "\n");
     }
@@ -947,32 +1086,155 @@ Deleted ${deletedCount} of ${matches.length} matching bindings.
       process.stdout.write("No bindings found.\n");
       return;
     }
-    const headers = ["PROJECT", "BRANCH", "PURPOSE", "NAME", "CLAIMED", "PORT", "CREATED_AT", "UPDATED_AT"];
+    const headers = ["PROJECT", "BRANCH", "PURPOSE", "NAME", "PORT", "CREATED_AT", "UPDATED_AT"];
     const widths = [
       Math.max(headers[0].length, ...rows.map((r) => r.project.length)),
       Math.max(headers[1].length, ...rows.map((r) => r.branch.length)),
       Math.max(headers[2].length, ...rows.map((r) => r.purpose.length)),
       Math.max(headers[3].length, ...rows.map((r) => r.name.length)),
-      Math.max(headers[4].length, ...rows.map((r) => String(r.claimed ?? 0).length)),
-      Math.max(headers[5].length, ...rows.map((r) => String(r.port).length)),
-      Math.max(headers[6].length, ...rows.map((r) => r.created_at.length)),
-      Math.max(headers[7].length, ...rows.map((r) => r.updated_at.length))
+      Math.max(headers[4].length, ...rows.map((r) => String(r.port).length)),
+      Math.max(headers[5].length, ...rows.map((r) => r.created_at.length)),
+      Math.max(headers[6].length, ...rows.map((r) => r.updated_at.length))
     ];
     const pad = (s, w) => s + " ".repeat(Math.max(0, w - s.length));
     const line = (cols) => cols.map((c, i) => pad(c, widths[i])).join("  ") + "\n";
     process.stdout.write(line(headers));
     process.stdout.write(line(widths.map((w) => "-".repeat(w))));
     for (const r of rows) {
-      process.stdout.write(line([r.project, r.branch, r.purpose, r.name, String(r.claimed ?? 0), String(r.port), r.created_at, r.updated_at]));
+      process.stdout.write(line([r.project, r.branch, r.purpose, r.name, String(r.port), r.created_at, r.updated_at]));
     }
     process.stdout.write(`
 Total: ${rows.length}  DB: ${cmdOpts.db ?? resolveDefaultDBPath()} (project=${project}, branch=${branch})
 `);
   });
+  const autoTmpl = auto.command("tmpl").description("Manage template strings with auto-derived variables from Git");
+  autoTmpl.command("claim").description("Claim a template instance with auto-derived vars from Git").requiredOption("--template <template>", "Template string with {placeholders}").allowUnknownOption().action(async (cmdOpts, command) => {
+    const { project, branch } = deriveFromGit();
+    const template = cmdOpts.template.trim();
+    const gitVars = { project, branch };
+    const userVars = {};
+    const args = command.args || [];
+    for (let i = 0; i < args.length; i += 2) {
+      if (typeof args[i] === "string" && args[i].startsWith("--")) {
+        const key = args[i].slice(2);
+        const value2 = args[i + 1];
+        if (typeof value2 === "string") {
+          userVars[key] = value2;
+        }
+      }
+    }
+    for (const [key, value2] of Object.entries(cmdOpts)) {
+      if (key !== "template" && typeof value2 === "string") {
+        userVars[key] = value2;
+      }
+    }
+    const finalVars = { ...gitVars, ...userVars };
+    const required = extractPlaceholders(template);
+    for (const key of required) {
+      if (!(key in finalVars)) {
+        throw new Error(`Missing variable: ${key}`);
+      }
+    }
+    const value = await claimTemplate(cmdOpts.db, template, finalVars);
+    const mode = toOutputMode(program2.opts());
+    if (mode === "json") {
+      const printResult2 = (m, obj) => {
+        process.stdout.write(JSON.stringify(obj) + "\n");
+      };
+      printResult2(mode, {
+        template,
+        vars: finalVars,
+        value,
+        db: cmdOpts.db ?? resolveDefaultDBPath()
+      });
+    } else {
+      process.stdout.write(value + "\n");
+    }
+  });
+  autoTmpl.command("list").description("List template instances for current project/branch").action((cmdOpts) => {
+    const { project, branch } = deriveFromGit();
+    const items = listTemplateStrings(cmdOpts.db);
+    const mode = toOutputMode(program2.opts());
+    const printResult2 = (m, obj) => {
+      process.stdout.write(JSON.stringify(obj) + "\n");
+    };
+    if (mode === "json") {
+      const filtered = items.filter(
+        (item) => item.vars.project === project && item.vars.branch === branch
+      );
+      printResult2(mode, { items: filtered, db: cmdOpts.db ?? resolveDefaultDBPath(), count: filtered.length, project, branch });
+    } else {
+      if (items.length === 0) {
+        process.stdout.write("No template strings found.\n");
+        return;
+      }
+      const filtered = items.filter(
+        (item) => item.vars.project === project && item.vars.branch === branch
+      );
+      if (filtered.length === 0) {
+        process.stdout.write(`No template strings found for project=${project}, branch=${branch}.
+`);
+        return;
+      }
+      const headers = ["TEMPLATE", "VARS", "VALUE", "CREATED_AT"];
+      const widths = [
+        Math.max(headers[0].length, ...filtered.map((i) => i.template.length)),
+        Math.max(headers[1].length, ...filtered.map((i) => JSON.stringify(i.vars).length)),
+        Math.max(headers[2].length, ...filtered.map((i) => i.value.length)),
+        Math.max(headers[3].length, ...filtered.map((i) => i.created_at.length))
+      ];
+      const pad = (s, w) => s + " ".repeat(Math.max(0, w - s.length));
+      const line = (cols) => cols.map((c, i) => pad(c, widths[i])).join("  ") + "\n";
+      process.stdout.write(line(headers));
+      process.stdout.write(line(widths.map((w) => "-".repeat(w))));
+      for (const item of filtered) {
+        process.stdout.write(line([
+          item.template,
+          JSON.stringify(item.vars),
+          item.value,
+          item.created_at
+        ]));
+      }
+      process.stdout.write(`
+Total: ${filtered.length}  DB: ${cmdOpts.db ?? resolveDefaultDBPath()} (project=${project}, branch=${branch})
+`);
+    }
+  });
+  autoTmpl.command("delete").description("Delete a template instance with auto-derived vars from Git").requiredOption("--template <template>", "Template string").allowUnknownOption().action((cmdOpts, command) => {
+    const { project, branch } = deriveFromGit();
+    const template = cmdOpts.template.trim();
+    const gitVars = { project, branch };
+    const userVars = {};
+    const args = command.args || [];
+    for (let i = 0; i < args.length; i += 2) {
+      if (typeof args[i] === "string" && args[i].startsWith("--")) {
+        const key = args[i].slice(2);
+        const value = args[i + 1];
+        if (typeof value === "string") {
+          userVars[key] = value;
+        }
+      }
+    }
+    for (const [key, value] of Object.entries(cmdOpts)) {
+      if (key !== "template" && typeof value === "string") {
+        userVars[key] = value;
+      }
+    }
+    const finalVars = { ...gitVars, ...userVars };
+    const ok = deleteTemplateString(cmdOpts.db, template, finalVars);
+    if (ok) {
+      process.stdout.write("Deleted.\n");
+    } else {
+      throw new Error("Template instance not found");
+    }
+  });
+}
+function toOutputMode(opts) {
+  return opts.json ? "json" : "text";
 }
 
 // src/index.ts
-function toOutputMode(opts) {
+function toOutputMode2(opts) {
   return opts.json ? "json" : "text";
 }
 function printResult(mode, payload) {
@@ -1005,11 +1267,18 @@ function ensurePurpose2(input) {
   }
 }
 var program = new import_commander.Command();
-program.name("ports").description("Allocate, query and delete unique ports by (project, branch, purpose).").version("0.3.0", "-v, --version", "Show version").helpOption("-h, --help", "Show help").addHelpCommand("help [command]", "Show help for command").showHelpAfterError().option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).hook("preAction", () => {
+program.name("ports").description("Allocate, query and delete unique ports by (project, branch, purpose).").version("0.3.0", "-v, --version", "Show version").helpOption("-h, --help", "Show help").addHelpCommand("help [command]", "Show help for command").showHelpAfterError().option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).addHelpText("after", `
+
+Documentation:
+  Quick start:         https://github.com/JMY1993/ports#install--build
+  Language guides:     https://github.com/JMY1993/ports#language-integration
+  Go best practices:   https://github.com/JMY1993/ports#go-recommended-setup
+  CLI reference:       ports --help [command]
+  Examples:            https://github.com/JMY1993/ports#examples`).hook("preAction", () => {
 });
 program.command("allocate").description("Allocate a port for given project, branch and purpose (idempotent).").requiredOption("-p, --project <project>", "Project name").requiredOption("-b, --branch <branch>", "Branch name").requiredOption("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-F, --fail-if-exists", "Fail if the tuple already exists instead of returning existing port", false).action((cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const project = sanitizeText(cmdOpts.project, "project");
   const branch = sanitizeText(cmdOpts.branch, "branch");
   const purpose = ensurePurpose2(cmdOpts.purpose);
@@ -1019,7 +1288,7 @@ program.command("allocate").description("Allocate a port for given project, bran
 });
 program.command("get").description("Get the port for given project, branch and purpose.").requiredOption("-p, --project <project>", "Project name").requiredOption("-b, --branch <branch>", "Branch name").requiredOption("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").action((cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const project = sanitizeText(cmdOpts.project, "project");
   const branch = sanitizeText(cmdOpts.branch, "branch");
   const purpose = ensurePurpose2(cmdOpts.purpose);
@@ -1031,7 +1300,7 @@ program.command("get").description("Get the port for given project, branch and p
 });
 program.command("delete").description("Delete a binding by key (project/branch/purpose/name) or by --port.").option("-p, --project <project>", "Project name").option("-b, --branch <branch>", "Branch name").option("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-P, --port <port>", "Delete by port number").option("-R, --range <start-end>", "Delete all bindings whose port in range START-END").option("-A, --all", "Delete all matches for the provided filters (requires at least --project)", false).option("-K, --kill", "Kill listeners on the matched ports before deletion", false).option("-y, --yes", "Confirm deleting multiple entries (non-interactive)", false).option("-d, --dry-run", "Preview actions without killing or deleting", false).option("-f, --force", "Delete records even if port cannot be freed", false).action(async (cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   if (cmdOpts.port && cmdOpts.range) {
     fail("Provide either --port or --range, not both.");
   }
@@ -1172,7 +1441,7 @@ Deleted ${deletedCount} of ${matches.length} matching bindings.
 });
 program.command("list").alias("ls").alias("view").description("List all bindings in a table (or JSON with --json).").option("-p, --project <project>", "Filter by project").option("-b, --branch <branch>", "Filter by branch").option("-u, --purpose <purpose>", "Filter by purpose").option("-n, --name <name>", "Filter by name").action((cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const rows = listBindingsFiltered(opts.db, {
     project: cmdOpts.project,
     branch: cmdOpts.branch,
@@ -1187,16 +1456,15 @@ program.command("list").alias("ls").alias("view").description("List all bindings
     process.stdout.write("No bindings found.\n");
     return;
   }
-  const headers = ["PROJECT", "BRANCH", "PURPOSE", "NAME", "CLAIMED", "PORT", "CREATED_AT", "UPDATED_AT"];
+  const headers = ["PROJECT", "BRANCH", "PURPOSE", "NAME", "PORT", "CREATED_AT", "UPDATED_AT"];
   const widths = [
     Math.max(headers[0].length, ...rows.map((r) => r.project.length)),
     Math.max(headers[1].length, ...rows.map((r) => r.branch.length)),
     Math.max(headers[2].length, ...rows.map((r) => r.purpose.length)),
     Math.max(headers[3].length, ...rows.map((r) => r.name.length)),
-    Math.max(headers[4].length, ...rows.map((r) => String(r.claimed ?? 0).length)),
-    Math.max(headers[5].length, ...rows.map((r) => String(r.port).length)),
-    Math.max(headers[6].length, ...rows.map((r) => r.created_at.length)),
-    Math.max(headers[7].length, ...rows.map((r) => r.updated_at.length))
+    Math.max(headers[4].length, ...rows.map((r) => String(r.port).length)),
+    Math.max(headers[5].length, ...rows.map((r) => r.created_at.length)),
+    Math.max(headers[6].length, ...rows.map((r) => r.updated_at.length))
   ];
   const pad = (s, w) => s + " ".repeat(Math.max(0, w - s.length));
   const line = (cols) => cols.map((c, i) => pad(c, widths[i])).join("  ") + "\n";
@@ -1204,7 +1472,7 @@ program.command("list").alias("ls").alias("view").description("List all bindings
   process.stdout.write(line(widths.map((w) => "-".repeat(w))));
   for (const r of rows) {
     process.stdout.write(
-      line([r.project, r.branch, r.purpose, r.name, String(r.claimed ?? 0), String(r.port), r.created_at, r.updated_at])
+      line([r.project, r.branch, r.purpose, r.name, String(r.port), r.created_at, r.updated_at])
     );
   }
   process.stdout.write(`
@@ -1213,17 +1481,17 @@ Total: ${rows.length}  DB: ${opts.db ?? resolveDefaultDBPath()}
 });
 program.command("claim").description("Safely claim a port for a given key, or, with --savage, reclaim it if currently occupied.").requiredOption("-p, --project <project>", "Project name").requiredOption("-b, --branch <branch>", "Branch name").requiredOption("-u, --purpose <purpose>", "Purpose: 'frontend' | 'backend'").option("-n, --name <name>", "Component/service name (default: default)").option("-S, --savage", "Reclaim the bound port by killing current listeners if occupied (only when record exists)", false).action(async (cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const project = sanitizeText(cmdOpts.project, "project");
   const branch = sanitizeText(cmdOpts.branch, "branch");
   const purpose = ensurePurpose2(cmdOpts.purpose);
   const name = (cmdOpts.name ?? "default").trim() || "default";
   const port = await claimPort(opts.db, project, branch, purpose, name, { savage: !!cmdOpts.savage });
-  printResult(mode, { project, branch, purpose, name, port, db: opts.db ?? resolveDefaultDBPath(), savage: !!cmdOpts.savage });
+  printResult(mode, { project, branch, purpose, name, port, db: opts.db ?? resolveDefaultDBPath() });
 });
 program.command("purpose").description("Manage custom purpose port ranges").command("set <purpose> <range>").description("Set or override a purpose range, e.g. job 9000-9099 or override frontend/backend").action((purpose, range) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const m = range.match(/^(\d+)-(\d+)$/);
   if (!m) fail("Invalid range. Use START-END");
   const start = parseInt(m[1], 10);
@@ -1248,7 +1516,7 @@ program.command("purpose").description("Manage custom purpose port ranges").comm
 });
 program.command("purpose-get <purpose>").description("Get effective purpose range (custom or built-in)").action((purpose) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const p = normalizePurpose(purpose);
   const { db } = (init_db(), __toCommonJS(db_exports)).openDB(opts.db);
   try {
@@ -1266,7 +1534,7 @@ program.command("purpose-get <purpose>").description("Get effective purpose rang
 });
 program.command("purpose-list").description("List all custom purpose ranges").action(() => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const { db } = (init_db(), __toCommonJS(db_exports)).openDB(opts.db);
   try {
     const rows = db.prepare("SELECT purpose, start, end, is_custom, updated_at FROM purpose_ranges ORDER BY purpose").all();
@@ -1297,7 +1565,7 @@ program.command("purpose-list").description("List all custom purpose ranges").ac
 });
 program.command("purpose-delete <purpose>").description("Delete a custom purpose range (builtin purposes will fall back to defaults)").action((purpose) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const p = normalizePurpose(purpose);
   const { db } = (init_db(), __toCommonJS(db_exports)).openDB(opts.db);
   try {
@@ -1338,7 +1606,7 @@ program.command("reserved-remove <port>").description("Unreserve a port").action
 });
 program.command("reserved-list").description("List reserved ports").action(() => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const { db } = (init_db(), __toCommonJS(db_exports)).openDB(opts.db);
   try {
     const rows = db.prepare("SELECT port, reason, created_at FROM reserved_ports ORDER BY port").all();
@@ -1367,7 +1635,7 @@ program.command("reserved-list").description("List reserved ports").action(() =>
 });
 program.command("migrate").description("Show DB schema version and optionally apply automatic migrations").option("-s, --status", "Show current DB and code schema versions", false).option("-a, --apply", "Apply migrations to upgrade DB to current schema", false).action((cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const ctx = openDB(opts.db);
   try {
     const dbVer = getDbVersion(ctx.db);
@@ -1399,7 +1667,7 @@ program.command("migrate").description("Show DB schema version and optionally ap
 });
 program.command("find").alias("free").description("Find a free OS port (and by default, not already registered) from a given port or range START-END").argument("<spec>", "Port or range, e.g. 3000 or 3000-3999").option("-I, --include-registered", "Ignore DB registrations; only check OS occupancy", false).option("-R, --include-reserved", "Ignore reserved ports; only check registration/OS", false).action(async (spec, cmdOpts) => {
   const opts = program.opts();
-  const mode = toOutputMode(opts);
+  const mode = toOutputMode2(opts);
   const m = spec.match(/^(\d+)(?:-(\d+))?$/);
   if (!m) fail("Invalid spec. Use PORT or START-END");
   let start = parseInt(m[1], 10);
@@ -1408,6 +1676,106 @@ program.command("find").alias("free").description("Find a free OS port (and by d
   if (start < 1 || start > 65535 || end < 1 || end > 65535) fail("Port must be 1-65535");
   const port = await findFreePort(opts.db, start, end, { includeRegistered: !!cmdOpts.includeRegistered, includeReserved: !!cmdOpts.includeReserved });
   printResult(mode, { port, start: Math.min(start, end), end: Math.max(start, end), db: opts.db ?? resolveDefaultDBPath(), includeRegistered: !!cmdOpts.includeRegistered, includeReserved: !!cmdOpts.includeReserved });
+});
+var tmpl = program.command("tmpl").description("Manage template strings for dynamic resources");
+tmpl.command("claim").description("Claim a template instance (idempotent: create-or-return)").requiredOption("--template <template>", "Template string with {placeholders}").allowUnknownOption().action(async (cmdOpts, command) => {
+  const opts = program.opts();
+  const mode = toOutputMode2(opts);
+  const template = cmdOpts.template.trim();
+  const vars = {};
+  const args = command.args || [];
+  for (let i = 0; i < args.length; i += 2) {
+    if (typeof args[i] === "string" && args[i].startsWith("--")) {
+      const key = args[i].slice(2);
+      const value2 = args[i + 1];
+      if (typeof value2 === "string") {
+        vars[key] = value2;
+      }
+    }
+  }
+  for (const [key, value2] of Object.entries(cmdOpts)) {
+    if (key !== "template" && typeof value2 === "string") {
+      vars[key] = value2;
+    }
+  }
+  const required = extractPlaceholders(template);
+  for (const key of required) {
+    if (!(key in vars)) {
+      throw new Error(`Missing variable: ${key}`);
+    }
+  }
+  const value = await claimTemplate(opts.db, template, vars);
+  if (mode === "json") {
+    printResult(mode, {
+      template,
+      vars,
+      value,
+      db: opts.db ?? resolveDefaultDBPath()
+    });
+  } else {
+    process.stdout.write(value + "\n");
+  }
+});
+tmpl.command("list").description("List all template instances").option("--template <template>", "Filter by template").action((cmdOpts) => {
+  const opts = program.opts();
+  const mode = toOutputMode2(opts);
+  const items = listTemplateStrings(opts.db, cmdOpts.template);
+  if (mode === "json") {
+    printResult(mode, { items, db: opts.db ?? resolveDefaultDBPath(), count: items.length });
+  } else {
+    if (items.length === 0) {
+      process.stdout.write("No template strings found.\n");
+      return;
+    }
+    const headers = ["TEMPLATE", "VARS", "VALUE", "CREATED_AT"];
+    const widths = [
+      Math.max(headers[0].length, ...items.map((i) => i.template.length)),
+      Math.max(headers[1].length, ...items.map((i) => JSON.stringify(i.vars).length)),
+      Math.max(headers[2].length, ...items.map((i) => i.value.length)),
+      Math.max(headers[3].length, ...items.map((i) => i.created_at.length))
+    ];
+    const pad = (s, w) => s + " ".repeat(Math.max(0, w - s.length));
+    const line = (cols) => cols.map((c, i) => pad(c, widths[i])).join("  ") + "\n";
+    process.stdout.write(line(headers));
+    process.stdout.write(line(widths.map((w) => "-".repeat(w))));
+    for (const item of items) {
+      process.stdout.write(line([
+        item.template,
+        JSON.stringify(item.vars),
+        item.value,
+        item.created_at
+      ]));
+    }
+    process.stdout.write(`
+Total: ${items.length}  DB: ${opts.db ?? resolveDefaultDBPath()}
+`);
+  }
+});
+tmpl.command("delete").description("Delete a template instance").requiredOption("--template <template>", "Template string").allowUnknownOption().action((cmdOpts, command) => {
+  const opts = program.opts();
+  const template = cmdOpts.template.trim();
+  const vars = {};
+  const args = command.args || [];
+  for (let i = 0; i < args.length; i += 2) {
+    if (typeof args[i] === "string" && args[i].startsWith("--")) {
+      const key = args[i].slice(2);
+      const value = args[i + 1];
+      if (typeof value === "string") {
+        vars[key] = value;
+      }
+    }
+  }
+  for (const [key, value] of Object.entries(cmdOpts)) {
+    if (key !== "template" && typeof value === "string") {
+      vars[key] = value;
+    }
+  }
+  const ok = deleteTemplateString(opts.db, template, vars);
+  if (ok) {
+    process.stdout.write("Deleted.\n");
+  } else {
+    throw new Error("Template instance not found");
+  }
 });
 registerAuto(program);
 program.parseAsync().catch((err) => {

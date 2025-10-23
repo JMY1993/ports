@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { resolveDefaultDBPath } from './db';
 import { normalizePurpose, Purpose } from './ranges';
 import { listBindingsFiltered, getBindingByPort, listBindingsByPortRange, deleteByPort, claimPort } from './core';
+import { claimTemplate, listTemplateStrings, deleteTemplateString, extractPlaceholders } from './templates';
 
 function tryExec(cmd: string): string | null {
   try {
@@ -73,7 +74,7 @@ export function registerAuto(program: Command) {
       const port = await claimPort(cmdOpts.db, project, branch, purpose, name, { savage: !!cmdOpts.savage });
       const json = !!(cmdOpts.json || (program.opts() as any)?.json);
       if (json) {
-        process.stdout.write(JSON.stringify({ project, branch, purpose, name, port, db: cmdOpts.db ?? resolveDefaultDBPath(), savage: !!cmdOpts.savage }) + '\n');
+        process.stdout.write(JSON.stringify({ project, branch, purpose, name, port, db: cmdOpts.db ?? resolveDefaultDBPath() }) + '\n');
       } else {
         process.stdout.write(String(port) + '\n');
       }
@@ -222,24 +223,200 @@ export function registerAuto(program: Command) {
         return;
       }
       if (rows.length === 0) { process.stdout.write('No bindings found.\n'); return; }
-      const headers = ['PROJECT', 'BRANCH', 'PURPOSE', 'NAME', 'CLAIMED', 'PORT', 'CREATED_AT', 'UPDATED_AT'];
+      const headers = ['PROJECT', 'BRANCH', 'PURPOSE', 'NAME', 'PORT', 'CREATED_AT', 'UPDATED_AT'];
       const widths = [
         Math.max(headers[0].length, ...rows.map(r => r.project.length)),
         Math.max(headers[1].length, ...rows.map(r => r.branch.length)),
         Math.max(headers[2].length, ...rows.map(r => r.purpose.length)),
         Math.max(headers[3].length, ...rows.map(r => r.name.length)),
-        Math.max(headers[4].length, ...rows.map(r => String(r.claimed ?? 0).length)),
-        Math.max(headers[5].length, ...rows.map(r => String(r.port).length)),
-        Math.max(headers[6].length, ...rows.map(r => r.created_at.length)),
-        Math.max(headers[7].length, ...rows.map(r => r.updated_at.length)),
+        Math.max(headers[4].length, ...rows.map(r => String(r.port).length)),
+        Math.max(headers[5].length, ...rows.map(r => r.created_at.length)),
+        Math.max(headers[6].length, ...rows.map(r => r.updated_at.length)),
       ];
       const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length));
       const line = (cols: string[]) => cols.map((c, i) => pad(c, widths[i])).join('  ') + '\n';
       process.stdout.write(line(headers));
       process.stdout.write(line(widths.map(w => '-'.repeat(w))));
       for (const r of rows) {
-        process.stdout.write(line([r.project, r.branch, r.purpose, r.name, String(r.claimed ?? 0), String(r.port), r.created_at, r.updated_at]));
+        process.stdout.write(line([r.project, r.branch, r.purpose, r.name, String(r.port), r.created_at, r.updated_at]));
       }
       process.stdout.write(`\nTotal: ${rows.length}  DB: ${cmdOpts.db ?? resolveDefaultDBPath()} (project=${project}, branch=${branch})\n`);
     });
+
+  // auto tmpl: template strings with auto-derived vars
+  const autoTmpl = auto.command('tmpl').description('Manage template strings with auto-derived variables from Git');
+
+  autoTmpl
+    .command('claim')
+    .description('Claim a template instance with auto-derived vars from Git')
+    .requiredOption('--template <template>', 'Template string with {placeholders}')
+    .allowUnknownOption()  // Allow arbitrary --key value pairs to override git vars
+    .action(async (cmdOpts, command) => {
+      const { project, branch } = deriveFromGit();
+
+      const template = cmdOpts.template.trim();
+
+      // Start with git-derived vars
+      const gitVars: Record<string, string> = { project, branch };
+
+      // Parse remaining args to extract --key value pairs (these override git vars)
+      const userVars: Record<string, string> = {};
+      const args = command.args || [];
+
+      for (let i = 0; i < args.length; i += 2) {
+        if (typeof args[i] === 'string' && args[i].startsWith('--')) {
+          const key = args[i].slice(2);
+          const value = args[i + 1];
+          if (typeof value === 'string') {
+            userVars[key] = value;
+          }
+        }
+      }
+
+      // Also check for options passed via cmdOpts
+      for (const [key, value] of Object.entries(cmdOpts)) {
+        if (key !== 'template' && typeof value === 'string') {
+          userVars[key] = value;
+        }
+      }
+
+      // Merge: user vars override git vars
+      const finalVars = { ...gitVars, ...userVars };
+
+      // Validate all placeholders have values
+      const required = extractPlaceholders(template);
+      for (const key of required) {
+        if (!(key in finalVars)) {
+          throw new Error(`Missing variable: ${key}`);
+        }
+      }
+
+      const value = await claimTemplate(cmdOpts.db, template, finalVars);
+
+      const mode = toOutputMode(program.opts() as any);
+      if (mode === 'json') {
+        const printResult = (m: string, obj: any) => {
+          process.stdout.write(JSON.stringify(obj) + '\n');
+        };
+        printResult(mode, {
+          template,
+          vars: finalVars,
+          value,
+          db: cmdOpts.db ?? resolveDefaultDBPath()
+        });
+      } else {
+        process.stdout.write(value + '\n');
+      }
+    });
+
+  autoTmpl
+    .command('list')
+    .description('List template instances for current project/branch')
+    .action((cmdOpts) => {
+      const { project, branch } = deriveFromGit();
+      const items = listTemplateStrings(cmdOpts.db);
+
+      const mode = toOutputMode(program.opts() as any);
+      const printResult = (m: string, obj: any) => {
+        process.stdout.write(JSON.stringify(obj) + '\n');
+      };
+
+      if (mode === 'json') {
+        // Filter to only items that contain project/branch vars
+        const filtered = items.filter(item =>
+          item.vars.project === project && item.vars.branch === branch
+        );
+        printResult(mode, { items: filtered, db: cmdOpts.db ?? resolveDefaultDBPath(), count: filtered.length, project, branch });
+      } else {
+        if (items.length === 0) {
+          process.stdout.write('No template strings found.\n');
+          return;
+        }
+
+        const filtered = items.filter(item =>
+          item.vars.project === project && item.vars.branch === branch
+        );
+
+        if (filtered.length === 0) {
+          process.stdout.write(`No template strings found for project=${project}, branch=${branch}.\n`);
+          return;
+        }
+
+        const headers = ['TEMPLATE', 'VARS', 'VALUE', 'CREATED_AT'];
+        const widths = [
+          Math.max(headers[0].length, ...filtered.map(i => i.template.length)),
+          Math.max(headers[1].length, ...filtered.map(i => JSON.stringify(i.vars).length)),
+          Math.max(headers[2].length, ...filtered.map(i => i.value.length)),
+          Math.max(headers[3].length, ...filtered.map(i => i.created_at.length))
+        ];
+
+        const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length));
+        const line = (cols: string[]) => cols.map((c, i) => pad(c, widths[i])).join('  ') + '\n';
+
+        process.stdout.write(line(headers));
+        process.stdout.write(line(widths.map(w => '-'.repeat(w))));
+
+        for (const item of filtered) {
+          process.stdout.write(line([
+            item.template,
+            JSON.stringify(item.vars),
+            item.value,
+            item.created_at
+          ]));
+        }
+
+        process.stdout.write(`\nTotal: ${filtered.length}  DB: ${cmdOpts.db ?? resolveDefaultDBPath()} (project=${project}, branch=${branch})\n`);
+      }
+    });
+
+  autoTmpl
+    .command('delete')
+    .description('Delete a template instance with auto-derived vars from Git')
+    .requiredOption('--template <template>', 'Template string')
+    .allowUnknownOption()  // Allow arbitrary --key value pairs to override git vars
+    .action((cmdOpts, command) => {
+      const { project, branch } = deriveFromGit();
+
+      const template = cmdOpts.template.trim();
+
+      // Start with git-derived vars
+      const gitVars: Record<string, string> = { project, branch };
+
+      // Parse remaining args to extract --key value pairs (these override git vars)
+      const userVars: Record<string, string> = {};
+      const args = command.args || [];
+
+      for (let i = 0; i < args.length; i += 2) {
+        if (typeof args[i] === 'string' && args[i].startsWith('--')) {
+          const key = args[i].slice(2);
+          const value = args[i + 1];
+          if (typeof value === 'string') {
+            userVars[key] = value;
+          }
+        }
+      }
+
+      // Also check for options passed via cmdOpts
+      for (const [key, value] of Object.entries(cmdOpts)) {
+        if (key !== 'template' && typeof value === 'string') {
+          userVars[key] = value;
+        }
+      }
+
+      // Merge: user vars override git vars
+      const finalVars = { ...gitVars, ...userVars };
+
+      const ok = deleteTemplateString(cmdOpts.db, template, finalVars);
+
+      if (ok) {
+        process.stdout.write('Deleted.\n');
+      } else {
+        throw new Error('Template instance not found');
+      }
+    });
+}
+
+// Helper function to convert json flag to output mode
+function toOutputMode(opts: { json?: boolean }): 'text' | 'json' {
+  return opts.json ? 'json' : 'text';
 }

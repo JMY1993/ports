@@ -21,11 +21,6 @@ Install / Build
 
 CLI
 
-- Allocate (idempotent)
-  - `ports allocate --project myproj --branch feat-x --purpose frontend [--name default]`
-  - Prints the allocated port; if the tuple already exists, returns the existing port.
-  - Use `--fail-if-exists` to error on existing tuple instead of returning the existing port.
-
 - Claim (safe by default; with --savage will reclaim if already registered and currently occupied)
   - `ports claim --project myproj --branch feat-x --purpose backend --name api`
     - If not registered: safely allocates a free, non-occupied port and registers it (never kills anything)
@@ -37,8 +32,18 @@ CLI
 - Get
   - `ports get --project myproj --branch feat-x --purpose frontend [--name default]`
 
-- Auto (derive project/branch from Git)
+- **⭐ Auto (recommended; derive project/branch from Git)**
+  - **Use `ports auto claim` instead of `ports claim` for most development workflows.**
   - Print derived keys: `ports auto keys` → `{ project, branch, slug, slug_pg }`
+
+- Allocate (⚠️ **Deprecated; use `claim` or `auto claim` instead**)
+  - `ports allocate --project myproj --branch feat-x --purpose frontend [--name default]`
+  - Prints the allocated port; if the tuple already exists, returns the existing port.
+  - Use `--fail-if-exists` to error on existing tuple instead of returning the existing port.
+  - **Note**: `allocate` does not check OS port availability; use `claim` for safer allocation.
+
+#### Auto commands continued
+
   - Claim using Git-derived project/branch: `ports auto claim -u backend [-n name] [--savage]`
   - Get using Git-derived project/branch: `ports auto get -u backend [-n name]`
   - Delete using Git-derived project/branch:
@@ -185,6 +190,139 @@ Purpose ranges (customize/override)
 Notes:
 - allocate/claim require a known purpose range. For custom purposes, call `ports purpose set ...` first.
 - Builtins: `frontend` → 3000–3999, `backend` → 8000–8999 (can be overridden via `purpose set`).
+
+Template strings (flexible resource bindings)
+
+For storing dynamic connection strings, file paths, or configuration values tied to your project/branch, use template strings. This is useful for database URIs, Redis configurations, file paths, etc.
+
+**Concepts:**
+- **Template**: A string with placeholders like `redis://{project}-{branch}-cache:6379`
+- **Variables**: Key-value pairs that fill placeholders (e.g., `{project: "myapp", branch: "main"}`)
+- **Value**: The rendered result after substituting variables into the template
+- **Idempotent claim**: Create-or-return semantics; calling with the same (template, vars) twice returns the same value
+
+**Basic commands:**
+
+- Claim a template instance (idempotent: create-or-return):
+  ```bash
+  ports tmpl claim --template "redis://{project}-{branch}-cache:6379" --project myapp --branch main
+  # Output: redis://myapp-main-cache:6379
+  ```
+  - Second call with same template and vars returns the same value immediately.
+
+- List all template instances:
+  ```bash
+  ports tmpl list
+  # Or filter by template:
+  ports tmpl list --template "redis://{project}-{branch}-cache:6379"
+  ```
+
+- Delete a template instance:
+  ```bash
+  ports tmpl delete --template "redis://{project}-{branch}-cache:6379" --project myapp --branch main
+  ```
+
+- JSON output:
+  ```bash
+  ports tmpl list --json
+  ```
+
+**Auto mode (Git-derived variables):**
+
+Use `ports auto tmpl` to automatically derive `project` and `branch` from your Git repository:
+
+- Claim with auto-derived project/branch (user vars override git vars):
+  ```bash
+  ports auto tmpl claim --template "sqlite://{project}/{branch}/{db}.db"
+  # Uses project and branch from git; if you need custom vars:
+  ports auto tmpl claim --template "redis://{project}-{branch}-{cache_type}:6379" --cache_type session
+  ```
+
+- List template instances for current project/branch:
+  ```bash
+  ports auto tmpl list
+  ```
+
+- Delete a template instance using auto-derived project/branch:
+  ```bash
+  ports auto tmpl delete --template "redis://{project}-{branch}-cache:6379"
+  ```
+
+**Examples:**
+
+```bash
+# 1. Store PostgreSQL connection string
+ports auto tmpl claim --template "postgresql://localhost:5432/{project}_{branch}" --db_user admin --db_pass secret
+# Returns: postgresql://localhost:5432/myapp_main
+
+# 2. Store file path with multiple variables
+ports auto tmpl claim --template "/var/data/{project}/{branch}/{env}/config.json" --env production
+# Returns: /var/data/myapp/main/production/config.json
+
+# 3. Store multiple cache configurations
+ports auto tmpl claim --template "redis://{project}-{branch}-session:6379"
+ports auto tmpl claim --template "redis://{project}-{branch}-cache:6380"
+ports auto tmpl claim --template "redis://{project}-{branch}-queue:6381"
+
+# 4. List all templates for current branch
+ports auto tmpl list
+
+# 5. Query JSON for integration with other tools
+ports auto tmpl list --json | jq '.items[] | {template, value}'
+```
+
+**Rules and design:**
+- Placeholders use `{name}` syntax; all placeholders in the template must have corresponding variables.
+- Variables are arbitrary key-value pairs (strings only; no nesting).
+- The (template, vars) pair must be unique; calling claim with the same pair twice is idempotent.
+- No `update` operation; to change a value, delete and re-claim with different variables.
+- No separate `get` operation; `claim` serves both create and read roles.
+
+**Language integration (template strings):**
+
+```typescript
+// TypeScript / Node.js
+import { execSync } from 'child_process';
+
+const result = JSON.parse(
+  execSync(`ports auto tmpl claim --template "redis://{project}-{branch}:6379" --json`, {
+    cwd: '/path/to/git/repo',
+    encoding: 'utf-8'
+  })
+);
+console.log(result.value); // redis://myapp-main:6379
+```
+
+```python
+# Python
+import subprocess
+import json
+
+result = json.loads(subprocess.check_output([
+    'ports', 'auto', 'tmpl', 'claim',
+    '--template', 'redis://{project}-{branch}:6379',
+    '--json'
+], cwd='/path/to/git/repo', text=True))
+print(result['value'])  # redis://myapp-main:6379
+```
+
+```go
+// Go
+import (
+  "encoding/json"
+  "os/exec"
+)
+
+cmd := exec.Command("ports", "auto", "tmpl", "claim",
+  "--template", "redis://{project}-{branch}:6379",
+  "--json")
+cmd.Dir = "/path/to/git/repo"
+output, _ := cmd.Output()
+
+var result map[string]interface{}
+json.Unmarshal(output, &result)
+// result["value"] = "redis://myapp-main:6379"
+```
 
 List all bindings
 
@@ -371,7 +509,7 @@ Tool schemas (selected)
 
 - `ports.claim`
   - input: `{ project: string, branch: string, purpose: string, name?: string = 'default', savage?: boolean = false }`
-  - behavior: safe claim; with `savage=true` and already registered, will reclaim occupied port; first-time claim never kills; marks `claimed=1` when savage is used.
+  - behavior: safe claim; with `savage=true` and already registered, will reclaim occupied port; first-time claim never kills.
 - `ports.allocate`
   - input: `{ project: string, branch: string, purpose: string, name?: string = 'default', failIfExists?: boolean = false }`
   - behavior: idempotent DB allocation (no OS check, no kill), skipping reserved ports.
@@ -380,7 +518,7 @@ Tool schemas (selected)
   - behavior: returns a currently OS-free port in range; by default excludes DB-registered and reserved ports.
 - `ports.list`
   - input: `{ project?: string, branch?: string, purpose?: string, name?: string }`
-  - behavior: returns bindings with fields: project, branch, purpose, name, claimed, port, created_at, updated_at.
+  - behavior: returns bindings with fields: project, branch, purpose, name, port, created_at, updated_at.
 
 DB selection for MCP
 
@@ -392,3 +530,525 @@ Safety notes for MCP consumers
 - `ports.claim` with `savage=true` may terminate processes that occupy the registered port. Use only in the designated owner flow; non-owners should call `ports.claim` without flags.
 - Purpose ranges must be defined (builtin: frontend/backend; custom via `ports.purpose.set`).
 - Reserved ports are skipped by allocate/claim and by default in `ports.find`.
+
+Language integration: calling vibe-ports from any language
+
+Since vibe-ports is a CLI tool, you can call it directly from any programming language using that language's shell execution API. No language-specific SDK package is needed.
+
+**Installation**
+
+```bash
+npm install -g vibe-ports
+# or locally in your project:
+npm install -D vibe-ports
+```
+
+**TypeScript / Node.js**
+
+```typescript
+import { execSync } from 'child_process';
+
+function claimPort(project: string, branch: string, purpose: string, name: string = 'default'): number {
+  const output = execSync(
+    `ports auto claim -u ${purpose} -n ${name} --json`,
+    {
+      cwd: '/path/to/your/git/repo',  // so git auto-derivation works
+      encoding: 'utf-8',
+      env: { ...process.env, VIBEPORTS_DB: process.env.VIBEPORTS_DB }
+    }
+  );
+  return JSON.parse(output).port;
+}
+
+const port = claimPort('myapp', 'main', 'backend', 'api');
+console.log(`Server listening on port ${port}`);
+```
+
+Or more simply (if project/branch are already known):
+
+```typescript
+import { execSync } from 'child_process';
+
+const port = parseInt(
+  execSync('ports claim -p myapp -b main -u backend -n api').toString().trim(),
+  10
+);
+```
+
+**Python**
+
+```python
+import subprocess
+import json
+import os
+
+def claim_port(project: str, branch: str, purpose: str, name: str = 'default') -> int:
+    output = subprocess.check_output([
+        'ports', 'auto', 'claim', '-u', purpose, '-n', name, '--json'
+    ], cwd='/path/to/your/git/repo', text=True)
+    return json.loads(output)['port']
+
+port = claim_port('myapp', 'main', 'backend', 'api')
+print(f'Server listening on port {port}')
+```
+
+Or with explicit project/branch:
+
+```python
+import subprocess
+
+port = int(subprocess.check_output([
+    'ports', 'claim',
+    '-p', 'myapp', '-b', 'main',
+    '-u', 'backend', '-n', 'api'
+]).decode().strip())
+```
+
+**Go**
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+)
+
+func claimPort(project, branch, purpose, name string) (int, error) {
+	cmd := exec.Command("ports", "auto", "claim",
+		"-u", purpose,
+		"-n", name,
+		"--json")
+	cmd.Dir = "/path/to/your/git/repo"
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return 0, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		return 0, err
+	}
+	return int(result["port"].(float64)), nil
+}
+
+func main() {
+	port, _ := claimPort("myapp", "main", "backend", "api")
+	fmt.Printf("Server listening on port %d\n", port)
+}
+```
+
+Or more simply:
+
+```go
+package main
+
+import (
+	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
+)
+
+func main() {
+	output, _ := exec.Command("ports", "claim",
+		"-p", "myapp", "-b", "main",
+		"-u", "backend", "-n", "api").Output()
+	port, _ := strconv.Atoi(strings.TrimSpace(string(output)))
+	fmt.Printf("Server listening on port %d\n", port)
+}
+```
+
+**Go: Recommended setup**
+
+For production-like Go projects, here's the recommended pattern:
+
+```go
+package ports
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+)
+
+// PortManager handles port allocation via vibe-ports CLI
+type PortManager struct {
+	// GitRepo is the path to the git repo for auto-derivation
+	// If empty, will use current directory
+	GitRepo string
+}
+
+// PortInfo contains the response from vibe-ports claim
+type PortInfo struct {
+	Project   string `json:"project"`
+	Branch    string `json:"branch"`
+	Purpose   string `json:"purpose"`
+	Name      string `json:"name"`
+	Port      int    `json:"port"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// NewPortManager creates a new port manager
+func NewPortManager(gitRepo string) *PortManager {
+	if gitRepo == "" {
+		gitRepo = "."
+	}
+	return &PortManager{GitRepo: gitRepo}
+}
+
+// ClaimAuto claims a port using auto-derived project/branch from Git
+// purpose should be "frontend", "backend", or custom (must be configured first)
+// name defaults to "default"
+func (pm *PortManager) ClaimAuto(purpose, name string) (int, error) {
+	if name == "" {
+		name = "default"
+	}
+
+	cmd := exec.Command("ports", "auto", "claim", "-u", purpose, "-n", name, "--json")
+	cmd.Dir = pm.GitRepo
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to claim port: %w", err)
+	}
+
+	var info PortInfo
+	if err := json.Unmarshal(output, &info); err != nil {
+		return 0, fmt.Errorf("failed to parse port info: %w", err)
+	}
+
+	return info.Port, nil
+}
+
+// ClaimAutoReclaim claims a port and kills occupants if needed
+// Only effective if the port is already registered; first claim never kills
+func (pm *PortManager) ClaimAutoReclaim(purpose, name string) (int, error) {
+	if name == "" {
+		name = "default"
+	}
+
+	cmd := exec.Command("ports", "auto", "claim", "-u", purpose, "-n", name, "--savage", "--json")
+	cmd.Dir = pm.GitRepo
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to claim port: %w", err)
+	}
+
+	var info PortInfo
+	if err := json.Unmarshal(output, &info); err != nil {
+		return 0, fmt.Errorf("failed to parse port info: %w", err)
+	}
+
+	return info.Port, nil
+}
+
+// GetAuto gets an already-claimed port using auto-derived project/branch
+func (pm *PortManager) GetAuto(purpose, name string) (int, error) {
+	if name == "" {
+		name = "default"
+	}
+
+	cmd := exec.Command("ports", "auto", "get", "-u", purpose, "-n", name)
+	cmd.Dir = pm.GitRepo
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("port not found: %w", err)
+	}
+
+	port, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil {
+		return 0, fmt.Errorf("invalid port: %w", err)
+	}
+
+	return port, nil
+}
+
+// Claim claims a port with explicit project/branch
+func (pm *PortManager) Claim(project, branch, purpose, name string) (int, error) {
+	if name == "" {
+		name = "default"
+	}
+
+	cmd := exec.Command("ports", "claim",
+		"-p", project, "-b", branch,
+		"-u", purpose, "-n", name, "--json")
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to claim port: %w", err)
+	}
+
+	var info PortInfo
+	if err := json.Unmarshal(output, &info); err != nil {
+		return 0, fmt.Errorf("failed to parse port info: %w", err)
+	}
+
+	return info.Port, nil
+}
+
+// Release releases a port using auto-derived project/branch
+func (pm *PortManager) ReleaseAuto(purpose, name string) error {
+	if name == "" {
+		name = "default"
+	}
+
+	cmd := exec.Command("ports", "auto", "delete", "-u", purpose, "-n", name)
+	cmd.Dir = pm.GitRepo
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to release port: %w", err)
+	}
+
+	return nil
+}
+```
+
+**Usage example:**
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+
+	"myapp/ports"
+)
+
+func main() {
+	// Create port manager (uses current git repo for auto-derivation)
+	pm := ports.NewPortManager(".")
+
+	// Claim port for backend service (safe claim)
+	port, err := pm.ClaimAuto("backend", "api")
+	if err != nil {
+		log.Fatalf("Failed to claim port: %v", err)
+	}
+
+	fmt.Printf("Backend API listening on port %d\n", port)
+
+	// Start your server
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Hello from port %d\n", port)
+	})
+
+	addr := fmt.Sprintf(":%d", port)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+}
+```
+
+**For service/daemon with reclaim (e.g., in a dev server restart script):**
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+
+	"myapp/ports"
+)
+
+func main() {
+	pm := ports.NewPortManager(".")
+
+	// Reclaim mode: kill any existing process on the registered port
+	// (only if the port was previously registered; first claim never kills)
+	port, err := pm.ClaimAutoReclaim("backend", "api")
+	if err != nil {
+		log.Fatalf("Failed to claim port: %v", err)
+	}
+
+	fmt.Printf("Claimed port %d (killed any occupants)\n", port)
+
+	// Verify port is actually free
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		log.Fatalf("Port %d is still occupied: %v", port, err)
+	}
+	defer listener.Close()
+
+	fmt.Printf("Port %d is confirmed free\n", port)
+}
+```
+
+**Go project structure recommendation:**
+
+```
+myapp/
+├── cmd/
+│   ├── api/
+│   │   └── main.go          ← starts backend server
+│   ├── worker/
+│   │   └── main.go          ← starts worker service
+│   └── web/
+│       └── main.go          ← starts dev proxy
+├── internal/
+│   ├── ports/
+│   │   └── manager.go       ← PortManager (shown above)
+│   ├── api/
+│   ├── worker/
+│   └── ...
+├── go.mod
+├── go.sum
+└── Makefile                 ← can use ports CLI
+```
+
+**Makefile example:**
+
+```makefile
+.PHONY: start-api start-worker start-all stop-all
+
+# Claim ports using auto-derivation, then start services
+start-api:
+	@go run ./cmd/api
+
+start-worker:
+	@go run ./cmd/worker
+
+start-all: start-api start-worker
+
+# Cleanup: release ports when done
+stop-all:
+	@ports auto delete -u backend -n api --kill
+	@ports auto delete -u backend -n worker --kill
+
+# Dev server restart: auto-reclaims port if occupied
+restart-api:
+	@killall -SIGINT api 2>/dev/null || true
+	@sleep 1
+	@go run ./cmd/api  # ClaimAutoReclaim ensures port is free
+```
+
+**Common patterns in Go:**
+
+1. **Graceful shutdown with port release:**
+   ```go
+   pm := ports.NewPortManager(".")
+   port, _ := pm.ClaimAuto("backend", "api")
+
+   sigChan := make(chan os.Signal, 1)
+   signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+   go func() {
+   	<-sigChan
+   	log.Println("Shutting down...")
+   	pm.ReleaseAuto("backend", "api")  // Release port on exit
+   	os.Exit(0)
+   }()
+   ```
+
+2. **Multiple services in one binary:**
+   ```go
+   apiPort, _ := pm.ClaimAuto("backend", "api")
+   workerPort, _ := pm.ClaimAuto("backend", "worker")
+   metricsPort, _ := pm.ClaimAuto("backend", "metrics")
+   ```
+
+3. **Conditional logic based on purpose:**
+   ```go
+   purposes := []string{"frontend", "backend", "worker"}
+   ports := make(map[string]int)
+
+   for _, purpose := range purposes {
+   	port, err := pm.ClaimAuto(purpose, "default")
+   	if err != nil {
+   		// Purpose not configured, skip
+   		continue
+   	}
+   	ports[purpose] = port
+   }
+   ```
+
+**Bash/Shell**
+
+```bash
+# Auto-derive from git (recommended)
+PORT=$(ports auto claim -u backend -n api)
+echo "Server listening on port $PORT"
+
+# Or explicit project/branch
+PORT=$(ports claim -p myapp -b main -u backend -n api)
+echo "Server listening on port $PORT"
+
+# Get an existing port
+PORT=$(ports auto get -u backend -n api)
+
+# Delete when done
+ports auto delete -u backend -n api
+```
+
+**Ruby**
+
+```ruby
+def claim_port(purpose, name = 'default')
+  output = `ports auto claim -u #{purpose} -n #{name}`
+  output.strip.to_i
+rescue => e
+  puts "Error claiming port: #{e.message}"
+  nil
+end
+
+port = claim_port('backend', 'api')
+puts "Server listening on port #{port}"
+```
+
+**Java / Kotlin**
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
+public class PortManager {
+  public static int claimPort(String purpose, String name) throws Exception {
+    ProcessBuilder pb = new ProcessBuilder(
+        "ports", "auto", "claim", "-u", purpose, "-n", name);
+    Process process = pb.start();
+
+    BufferedReader reader = new BufferedReader(
+        new InputStreamReader(process.getInputStream()));
+    String port = reader.readLine().strip();
+    return Integer.parseInt(port);
+  }
+
+  public static void main(String[] args) throws Exception {
+    int port = claimPort("backend", "api");
+    System.out.println("Server listening on port " + port);
+  }
+}
+```
+
+**General pattern (any language)**
+
+1. Install vibe-ports globally: `npm install -g vibe-ports`
+2. Call the CLI using your language's shell execution API
+3. Parse the JSON output (when using `--json`) or plain text output
+4. Use the returned port number
+
+**Tips**
+
+- Use `ports auto claim` when developing in a git repository (auto-derives project/branch)
+- Use `--json` flag for reliable parsing in code
+- For non-git environments, use explicit `--project` and `--branch` flags
+- Wrap calls in try/catch or error handling in case `ports` command is not installed
+- Set `VIBEPORTS_DB` environment variable if using non-default database location

@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS bindings (
   branch TEXT NOT NULL,
   purpose TEXT NOT NULL,
   name TEXT NOT NULL DEFAULT 'default',
-  claimed INTEGER NOT NULL DEFAULT 0,
   port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -41,8 +40,35 @@ BEGIN
   UPDATE bindings SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = OLD.id;
 END;
 
--- Set current schema version if not present (code expects 2)
-INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '5');
+-- Template strings table (dynamic resource binding)
+CREATE TABLE IF NOT EXISTS template_strings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  template TEXT NOT NULL,
+  vars TEXT NOT NULL,                    -- JSON string with sorted keys
+  value TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (length(trim(template)) > 0),
+  CHECK (length(trim(vars)) > 0),
+  CHECK (length(trim(value)) > 0),
+  CHECK (json_valid(vars) = 1)
+);
+
+-- Uniqueness: template + vars combination
+CREATE UNIQUE INDEX IF NOT EXISTS idx_template_strings_unique_combo
+  ON template_strings(template, vars);
+
+-- Trigger: auto-update updated_at on change
+CREATE TRIGGER IF NOT EXISTS template_strings_updated
+AFTER UPDATE ON template_strings
+FOR EACH ROW
+BEGIN
+  UPDATE template_strings SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE id = OLD.id;
+END;
+
+-- Set current schema version if not present (code expects 7)
+INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '7');
 
 -- Purpose ranges (customizable). If a purpose exists here, it overrides built-ins.
 CREATE TABLE IF NOT EXISTS purpose_ranges (

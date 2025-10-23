@@ -9,7 +9,6 @@ export interface BindingRow {
   branch: string;
   purpose: string;
   name: string;
-  claimed: number;
   port: number;
   created_at: string;
   updated_at: string;
@@ -50,7 +49,7 @@ export function allocatePort(
     }
 
     const insertStmt = db.prepare(
-      'INSERT INTO bindings (project, branch, purpose, name, claimed, port) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT INTO bindings (project, branch, purpose, name, port) VALUES (?, ?, ?, ?, ?)'
     );
 
     const range = getRangeForPurposeFromDB(db, purpose);
@@ -73,7 +72,7 @@ export function allocatePort(
       for (let p = range.start; p <= range.end; p++) {
         if (isReserved.get(p)) continue;
         try {
-          insertStmt.run(project, branch, purpose, name, 0, p);
+          insertStmt.run(project, branch, purpose, name, p);
           return p;
         } catch (err: any) {
           const msg: string = err?.message ?? '';
@@ -127,7 +126,7 @@ export function listBindings(dbPath: string | undefined): BindingRow[] {
   const { db } = ctx;
   try {
     const rows = db
-      .prepare('SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings ORDER BY project, branch, purpose, name')
+      .prepare('SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings ORDER BY project, branch, purpose, name')
       .all() as BindingRow[];
     return rows;
   } finally {
@@ -149,7 +148,7 @@ export function listBindingsFiltered(
     if (filters?.purpose) { conds.push('purpose = ?'); params.push(filters.purpose); }
     if (filters?.name) { conds.push('name = ?'); params.push(filters.name); }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-    const sql = `SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings ${where} ORDER BY project, branch, purpose, name`;
+    const sql = `SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings ${where} ORDER BY project, branch, purpose, name`;
     const rows = db.prepare(sql).all(...params) as BindingRow[];
     return rows;
   } finally {
@@ -185,7 +184,7 @@ export async function claimPort(
         );
       }
       const insert = db.prepare(
-        'INSERT INTO bindings (project, branch, purpose, name, claimed, port) VALUES (?, ?, ?, ?, ?, ?)'
+        'INSERT INTO bindings (project, branch, purpose, name, port) VALUES (?, ?, ?, ?, ?)'
       );
       const checkAgain = () => select.get(project, branch, purpose, name) as { port: number } | undefined;
       if (checkAgain()) return (checkAgain() as any).port;
@@ -194,7 +193,7 @@ export async function claimPort(
         const tx = db.transaction((p: number) => {
           const a = checkAgain();
           if (a) return a.port;
-          insert.run(project, branch, purpose, name, opts?.savage ? 1 : 0, p);
+          insert.run(project, branch, purpose, name, p);
           return p;
         });
         return tx(port);
@@ -208,9 +207,6 @@ export async function claimPort(
         if (!free) continue;
         try {
           const got = insertOnce(p);
-          if (opts?.savage) {
-            db.prepare('UPDATE bindings SET claimed = 1 WHERE port = ?').run(got as number);
-          }
           return got as number;
         } catch (e: any) {
           // unique conflict on port or combo -> try next
@@ -226,8 +222,6 @@ export async function claimPort(
       if (!free) {
         await killPortOccupants(currentPort);
       }
-      // Mark as claimed (owner uses savage)
-      db.prepare('UPDATE bindings SET claimed = 1 WHERE port = ?').run(currentPort);
       return currentPort;
     }
     return currentPort;
@@ -312,7 +306,7 @@ export function getBindingByPort(
   try {
     const row = db
       .prepare(
-        'SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings WHERE port = ? LIMIT 1'
+        'SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings WHERE port = ? LIMIT 1'
       )
       .get(port) as BindingRow | undefined;
     return row;
@@ -332,7 +326,7 @@ export function listBindingsByPortRange(
   try {
     const rows = db
       .prepare(
-        'SELECT project, branch, purpose, name, claimed, port, created_at, updated_at FROM bindings WHERE port BETWEEN ? AND ? ORDER BY port'
+        'SELECT project, branch, purpose, name, port, created_at, updated_at FROM bindings WHERE port BETWEEN ? AND ? ORDER BY port'
       )
       .all(start, end) as BindingRow[];
     return rows;

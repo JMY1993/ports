@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import Database from 'better-sqlite3';
 
-export const CODE_SCHEMA_VERSION = 5;
+export const CODE_SCHEMA_VERSION = 7;
 
 export interface DBContext {
   db: Database.Database;
@@ -122,6 +122,70 @@ function maybeMigrate(db: Database.Database) {
         db.exec("ALTER TABLE bindings ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0");
       }
       dbVersion = 5;
+      setDbVersion(db, dbVersion);
+      continue;
+    }
+    if (dbVersion === 5) {
+      // v5 -> v6: drop claimed column (pure behavior flag, not state)
+      const cols = db.prepare("PRAGMA table_info('bindings')").all() as Array<{ name: string }>;
+      const hasClaimed = cols.some((c) => c.name === 'claimed');
+      if (hasClaimed) {
+        // SQLite doesn't support DROP COLUMN directly in older versions, so we recreate the table
+        db.exec(`
+          CREATE TABLE bindings_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT 'default',
+            port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (length(trim(project)) > 0),
+            CHECK (length(trim(branch)) > 0),
+            CHECK (length(trim(purpose)) > 0),
+            CHECK (length(trim(name)) > 0)
+          );
+          INSERT INTO bindings_new SELECT id, project, branch, purpose, name, port, created_at, updated_at FROM bindings;
+          DROP TABLE bindings;
+          ALTER TABLE bindings_new RENAME TO bindings;
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_unique_combo ON bindings(project, branch, purpose, name);
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_port_unique ON bindings(port);
+        `);
+      }
+      dbVersion = 6;
+      setDbVersion(db, dbVersion);
+      continue;
+    }
+    if (dbVersion === 6) {
+      // v6 -> v7: add template_strings table for dynamic resource binding
+      const hasTemplateStrings = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='template_strings'").get();
+      if (!hasTemplateStrings) {
+        db.exec(`
+          CREATE TABLE template_strings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template TEXT NOT NULL,
+            vars TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (length(trim(template)) > 0),
+            CHECK (length(trim(vars)) > 0),
+            CHECK (length(trim(value)) > 0),
+            CHECK (json_valid(vars) = 1)
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_template_strings_unique_combo
+            ON template_strings(template, vars);
+          CREATE TRIGGER IF NOT EXISTS template_strings_updated
+          AFTER UPDATE ON template_strings
+          FOR EACH ROW
+          BEGIN
+            UPDATE template_strings SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = OLD.id;
+          END;
+        `);
+      }
+      dbVersion = 7;
       setDbVersion(db, dbVersion);
       continue;
     }
