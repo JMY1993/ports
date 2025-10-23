@@ -94,7 +94,7 @@ const program = new Command();
 program
   .name('ports')
   .description('Allocate, query and delete unique ports by (project, branch, purpose).')
-  .version('0.3.0', '-v, --version', 'Show version')
+  .version('0.4.0', '-v, --version', 'Show version')
   .helpOption('-h, --help', 'Show help')
   .addHelpCommand('help [command]', 'Show help for command')
   .showHelpAfterError()

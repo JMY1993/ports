@@ -1267,7 +1267,7 @@ function ensurePurpose2(input) {
   }
 }
 var program = new import_commander.Command();
-program.name("ports").description("Allocate, query and delete unique ports by (project, branch, purpose).").version("0.3.0", "-v, --version", "Show version").helpOption("-h, --help", "Show help").addHelpCommand("help [command]", "Show help for command").showHelpAfterError().option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).addHelpText("after", `
+program.name("ports").description("Allocate, query and delete unique ports by (project, branch, purpose).").version("0.4.0", "-v, --version", "Show version").helpOption("-h, --help", "Show help").addHelpCommand("help [command]", "Show help for command").showHelpAfterError().option("-D, --db <path>", "Path to SQLite DB (default: ~/.vibeports/vibeports.sqlite3)").option("-j, --json", "Output JSON", false).addHelpText("after", `
 
 Documentation:
   Quick start:         https://github.com/JMY1993/ports#install--build
