@@ -1778,11 +1778,48 @@ tmpl.command("delete").description("Delete a template instance").requiredOption(
   }
 });
 registerAuto(program);
-program.parseAsync().catch((err) => {
-  process.stderr.write((err?.message || String(err)) + "\n");
-  process.exit(1);
+program.command("ui").description("Start the Web UI dashboard server for managing ports and templates").option("-p, --port <port>", "Port for UI server (default: auto-allocate via vibe-ports)").option("--no-open", "Don't open browser automatically").action(async (cmdOpts) => {
+  try {
+    const isWin = process.platform === "win32";
+    const nodeCmd = isWin ? "node" : "node";
+    const serverPath = import_node_path2.default.join(__dirname, "..", "..", "server", "dist", "index.js");
+    let uiPort;
+    if (cmdOpts.port) {
+      uiPort = cmdOpts.port;
+    } else {
+      try {
+        uiPort = (0, import_node_child_process2.execSync)("npx vibe-ports@latest claim -p vibe-ports -b main -u frontend", {
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf-8"
+        }).toString().trim();
+      } catch {
+        uiPort = "3000";
+      }
+    }
+    process.env.PORT = uiPort;
+    process.stdout.write(`
+\u{1F680} Starting Vibe Ports UI Server on port ${uiPort}
+`);
+    process.stdout.write(`   Open http://localhost:${uiPort} in your browser
+`);
+    process.stdout.write(`   Press Ctrl+C to stop
+
+`);
+    const { execSync: exec2 } = require("child_process");
+    exec2(`${nodeCmd} "${serverPath}"`, {
+      cwd: import_node_path2.default.join(__dirname, "..", "..", "server"),
+      env: { ...process.env, PORT: uiPort },
+      stdio: "inherit"
+    });
+  } catch (error) {
+    fail(`Failed to start UI server: ${error?.message || String(error)}`);
+  }
 });
 program.command("mcp").description("Start MCP server over stdio exposing vibe-ports tools").action(async () => {
   const opts = program.opts();
   await startMCP(opts.db);
+});
+program.parseAsync().catch((err) => {
+  process.stderr.write((err?.message || String(err)) + "\n");
+  process.exit(1);
 });

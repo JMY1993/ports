@@ -10,12 +10,17 @@
   "main": "dist/index.js",
   "files": [
     "dist",
+    "server/dist",
+    "ui/dist",
     "db/baseline.sql",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs --target node18 --out-dir dist",
+    "build": "npm run build:cli && npm run build:server && npm run build:ui",
+    "build:cli": "tsup src/index.ts --format cjs --target node18 --out-dir dist",
+    "build:server": "cd server && npm run build",
+    "build:ui": "cd ui && npm run build",
     "dev": "tsx src/index.ts --help",
     "test": "npm run -s build && vitest run",
     "prepack": "npm run build"

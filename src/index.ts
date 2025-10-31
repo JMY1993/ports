@@ -744,10 +744,53 @@ tmpl
 
 // Register auto commands (Git-derived project/branch helpers)
 registerAuto(program);
-program.parseAsync().catch((err) => {
-  process.stderr.write((err?.message || String(err)) + '\n');
-  process.exit(1);
-});
+
+// UI Server command
+program
+  .command('ui')
+  .description('Start the Web UI dashboard server for managing ports and templates')
+  .option('-p, --port <port>', 'Port for UI server (default: auto-allocate via vibe-ports)')
+  .option('--no-open', 'Don\'t open browser automatically')
+  .action(async (cmdOpts: { port?: string; open?: boolean }) => {
+    try {
+      const isWin = process.platform === 'win32';
+      const nodeCmd = isWin ? 'node' : 'node';
+      const serverPath = path.join(__dirname, '..', '..', 'server', 'dist', 'index.js');
+
+      // If port is not specified, allocate one via vibe-ports
+      let uiPort: string;
+      if (cmdOpts.port) {
+        uiPort = cmdOpts.port;
+      } else {
+        try {
+          uiPort = execSync('npx vibe-ports@latest claim -p vibe-ports -b main -u frontend', {
+            stdio: ['ignore', 'pipe', 'ignore'],
+            encoding: 'utf-8'
+          }).toString().trim();
+        } catch {
+          // Fallback to hardcoded port if vibe-ports fails
+          uiPort = '3000';
+        }
+      }
+
+      process.env.PORT = uiPort;
+
+      process.stdout.write(`\n🚀 Starting Vibe Ports UI Server on port ${uiPort}\n`);
+      process.stdout.write(`   Open http://localhost:${uiPort} in your browser\n`);
+      process.stdout.write(`   Press Ctrl+C to stop\n\n`);
+
+      // Start the Hono server
+      const { execSync: exec } = require('child_process');
+      exec(`${nodeCmd} "${serverPath}"`, {
+        cwd: path.join(__dirname, '..', '..', 'server'),
+        env: { ...process.env, PORT: uiPort },
+        stdio: 'inherit'
+      });
+    } catch (error: any) {
+      fail(`Failed to start UI server: ${error?.message || String(error)}`);
+    }
+  });
+
 program
   .command('mcp')
   .description('Start MCP server over stdio exposing vibe-ports tools')
@@ -755,3 +798,8 @@ program
     const opts = program.opts<CommonOpts>();
     await startMCP(opts.db);
   });
+
+program.parseAsync().catch((err) => {
+  process.stderr.write((err?.message || String(err)) + '\n');
+  process.exit(1);
+});
